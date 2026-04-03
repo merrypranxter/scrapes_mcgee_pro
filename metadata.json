@@ -1,0 +1,5 @@
+{
+  "name": "Scrapes McGee",
+  "description": "A powerful, conversational web scraping agent that can extract data, perform deep crawls, and export results in multiple formats.",
+  "requestFramePermissions": []
+}
