@@ -1,5 +1,5 @@
 {
   "name": "Scrapes McGee",
-  "description": "A powerful, conversational web scraping agent that can extract data, perform deep crawls, and export results in multiple formats.",
+  "description": "A powerful web scraping agent with THE SWARM analysis system and automatic GitHub backup integration.",
   "requestFramePermissions": []
 }
