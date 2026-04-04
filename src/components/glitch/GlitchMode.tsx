@@ -15,7 +15,11 @@ import {
   GripVertical,
   ArrowDown,
   Check,
-  Link2
+  Link2,
+  Palette,
+  Grid3x3,
+  Repeat,
+  Sparkles
 } from 'lucide-react';
 import { motion, AnimatePresence, Reorder } from 'motion/react';
 import { cn } from '../../lib/utils';
@@ -40,6 +44,11 @@ interface Transition {
   gop: number;
   quality: 'low' | 'med' | 'high';
   overlapFrames: number;
+  // Post-processing filters
+  colorMode: 'normal' | 'invert' | 'grayscale' | 'greyInvert';
+  mirrorMode: 'none' | 'horizontal' | 'vertical' | 'quad';
+  repeatEcho: number;
+  patternOverlay: 'none' | 'stripes' | 'checkerboard';
 }
 
 type ExportMode = 'final' | 'all_stages';
@@ -56,7 +65,6 @@ export default function GlitchMode() {
   const [exportMode, setExportMode] = useState<ExportMode>('final');
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Load FFmpeg on mount
   React.useEffect(() => {
     loadFFmpeg();
   }, []);
@@ -110,7 +118,6 @@ export default function GlitchMode() {
           
           setVideos(prev => {
             const updated = [...prev, newVideo];
-            // Auto-create transitions when adding videos
             if (updated.length > 1) {
               createTransitionsForVideos(updated);
             }
@@ -140,6 +147,10 @@ export default function GlitchMode() {
           gop: 12,
           quality: 'med',
           overlapFrames: 15,
+          colorMode: 'normal',
+          mirrorMode: 'none',
+          repeatEcho: 0,
+          patternOverlay: 'none',
         });
       }
     }
@@ -158,13 +169,55 @@ export default function GlitchMode() {
   const deleteVideo = (id: string) => {
     setVideos(prev => {
       const updated = prev.filter(v => v.id !== id);
-      // Rebuild transitions after deleting
       setTransitions([]);
       if (updated.length > 1) {
         createTransitionsForVideos(updated);
       }
       return updated;
     });
+  };
+
+  const buildFilterChain = (transition: Transition): string => {
+    const filters: string[] = [];
+
+    // Color modes
+    if (transition.colorMode === 'invert') {
+      filters.push('negate');
+    } else if (transition.colorMode === 'grayscale') {
+      filters.push('hue=s=0');
+    } else if (transition.colorMode === 'greyInvert') {
+      filters.push('hue=s=0,negate');
+    }
+
+    // Repeat echo (temporal blending)
+    if (transition.repeatEcho > 0) {
+      const frames = transition.repeatEcho + 1;
+      const weights = Array(frames).fill('1').join(' ');
+      filters.push(`tmix=frames=${frames}:weights='${weights}'`);
+    }
+
+    // Mirror modes
+    if (transition.mirrorMode === 'horizontal') {
+      filters.push('crop=iw/2:ih:0:0,split[left][tmp];[tmp]hflip[right];[left][right]hstack');
+    } else if (transition.mirrorMode === 'vertical') {
+      filters.push('crop=iw:ih/2:0:0,split[top][tmp];[tmp]vflip[bottom];[top][bottom]vstack');
+    } else if (transition.mirrorMode === 'quad') {
+      // Quad mirror: take top-left quarter, mirror to create 4-way symmetry
+      filters.push(
+        'crop=iw/2:ih/2:0:0,split=4[tl1][tl2][tl3][tl4];' +
+        '[tl2]hflip[tr];[tl3]vflip[bl];[tl4]hflip,vflip[br];' +
+        '[tl1][tr]hstack[top];[bl][br]hstack[bottom];[top][bottom]vstack'
+      );
+    }
+
+    // Pattern overlays
+    if (transition.patternOverlay === 'stripes') {
+      filters.push("geq='lum=if(mod(X+Y,20)<10,p(X,Y),255-p(X,Y))'");
+    } else if (transition.patternOverlay === 'checkerboard') {
+      filters.push("geq='lum=if(mod(floor(X/20)+floor(Y/20),2),p(X,Y),255-p(X,Y))'");
+    }
+
+    return filters.length > 0 ? filters.join(',') : '';
   };
 
   const processCascade = async () => {
@@ -175,7 +228,6 @@ export default function GlitchMode() {
     const outputFiles: { name: string; data: Uint8Array }[] = [];
 
     try {
-      // Write all input videos to FFmpeg
       for (let i = 0; i < videos.length; i++) {
         setProcessingStage(`Loading video ${i + 1}/${videos.length}...`);
         await ffmpeg.writeFile(`input_${i}.mp4`, await fetchFile(videos[i].file));
@@ -183,7 +235,6 @@ export default function GlitchMode() {
 
       let currentOutput = 'input_0.mp4';
       
-      // Process each transition
       for (let i = 0; i < transitions.length; i++) {
         const transition = transitions[i];
         const fromIdx = videos.findIndex(v => v.id === transition.fromVideoId);
@@ -193,13 +244,13 @@ export default function GlitchMode() {
         
         const nextInput = `input_${toIdx}.mp4`;
         const outputName = `cascade_${i}.mp4`;
+        const qualityMap = { low: '100k', med: '500k', high: '2M' };
         
         if (transition.mode === 'iframe') {
-          // I-frame replacement datamosh
-          const qualityMap = { low: '100k', med: '500k', high: '2M' };
-          
-          // Extract last frames from current output
           const lastFramesOutput = `last_frames_${i}.mp4`;
+          const filterChain = buildFilterChain(transition);
+          const vfArg = filterChain ? ['-vf', filterChain] : [];
+          
           await ffmpeg.exec([
             '-i', currentOutput,
             '-vf', `select='gte(n\\,${transition.overlapFrames})'`,
@@ -210,40 +261,59 @@ export default function GlitchMode() {
             lastFramesOutput
           ]);
           
-          // Extract frames from next input without I-frames
           const noIframesOutput = `no_iframes_${i}.mp4`;
           await ffmpeg.exec([
             '-i', nextInput,
             '-vf', `select='not(mod(n\\,${transition.delta}))'`,
             '-vsync', '0',
             '-c:v', 'libx264',
-            '-g', '999', // Huge GOP to minimize I-frames
+            '-g', '999',
             '-b:v', qualityMap[transition.quality],
             noIframesOutput
           ]);
           
-          // Concatenate
           const concatList = `file '${lastFramesOutput}'\nfile '${noIframesOutput}'`;
           await ffmpeg.writeFile(`concat_${i}.txt`, concatList);
           
+          const concatOutput = `concat_temp_${i}.mp4`;
           await ffmpeg.exec([
             '-f', 'concat',
             '-safe', '0',
             '-i', `concat_${i}.txt`,
             '-c', 'copy',
-            outputName
+            concatOutput
           ]);
+
+          // Apply post-processing filters
+          if (filterChain) {
+            await ffmpeg.exec([
+              '-i', concatOutput,
+              ...vfArg,
+              '-c:v', 'libx264',
+              '-b:v', qualityMap[transition.quality],
+              outputName
+            ]);
+          } else {
+            await ffmpeg.exec([
+              '-i', concatOutput,
+              '-c', 'copy',
+              outputName
+            ]);
+          }
           
         } else {
-          // Pixel blend mode
-          const qualityMap = { low: '100k', med: '500k', high: '2M' };
-          const blendDuration = transition.overlapFrames / 25; // Assuming 25fps
+          const filterChain = buildFilterChain(transition);
+          const blendDuration = transition.overlapFrames / 25;
+          let filterComplex = `[0:v][1:v]xfade=transition=fade:duration=${blendDuration}:offset=0[v]`;
+          
+          if (filterChain) {
+            filterComplex = `[0:v][1:v]xfade=transition=fade:duration=${blendDuration}:offset=0[tmp];[tmp]${filterChain}[v]`;
+          }
           
           await ffmpeg.exec([
             '-i', currentOutput,
             '-i', nextInput,
-            '-filter_complex',
-            `[0:v][1:v]xfade=transition=fade:duration=${blendDuration}:offset=0[v]`,
+            '-filter_complex', filterComplex,
             '-map', '[v]',
             '-c:v', 'libx264',
             '-g', transition.gop.toString(),
@@ -252,7 +322,6 @@ export default function GlitchMode() {
           ]);
         }
         
-        // Save stage if export mode is all_stages
         if (exportMode === 'all_stages') {
           const stageData = await ffmpeg.readFile(outputName);
           outputFiles.push({
@@ -264,7 +333,6 @@ export default function GlitchMode() {
         currentOutput = outputName;
       }
       
-      // Read final output
       setProcessingStage('Finalizing...');
       const finalData = await ffmpeg.readFile(currentOutput);
       outputFiles.push({
@@ -272,7 +340,6 @@ export default function GlitchMode() {
         data: finalData as Uint8Array
       });
       
-      // Download all files
       for (const output of outputFiles) {
         const blob = new Blob([output.data], { type: 'video/mp4' });
         const url = URL.createObjectURL(blob);
@@ -296,12 +363,11 @@ export default function GlitchMode() {
   return (
     <div className="min-h-screen bg-[#09090b] text-white p-6">
       <div className="max-w-7xl mx-auto">
-        {/* Header */}
         <div className="mb-8">
           <h1 className="text-4xl font-bold bg-gradient-to-r from-[#00ff88] via-[#00ddff] to-[#ff00ff] bg-clip-text text-transparent mb-2">
             DATAMOSH CASCADE
           </h1>
-          <p className="text-zinc-400">Chain unlimited videos with no bullshit limitations</p>
+          <p className="text-zinc-400">Chain unlimited videos • No bullshit limitations • Full filter control</p>
         </div>
 
         {loading && (
@@ -313,7 +379,6 @@ export default function GlitchMode() {
 
         {!loading && (
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-            {/* Left: Video Queue */}
             <div className="lg:col-span-1 space-y-4">
               <div className="bg-[#18181b] border border-zinc-800 rounded-2xl p-4">
                 <h2 className="text-sm font-bold text-[#00ff88] mb-4 flex items-center gap-2">
@@ -342,13 +407,11 @@ export default function GlitchMode() {
                   onChange={handleFileUpload}
                 />
 
-                {/* Video Queue */}
                 <div className="space-y-2">
                   <Reorder.Group axis="y" values={videos} onReorder={setVideos}>
                     {videos.map((video, idx) => (
                       <Reorder.Item key={video.id} value={video}>
                         <div className="mb-3">
-                          {/* Video Card */}
                           <div className="p-3 rounded-lg bg-zinc-900 border border-zinc-800">
                             <div className="flex items-center gap-3">
                               <GripVertical size={16} className="text-zinc-600 cursor-grab active:cursor-grabbing" />
@@ -368,7 +431,6 @@ export default function GlitchMode() {
                             </div>
                           </div>
                           
-                          {/* Transition Arrow */}
                           {idx < videos.length - 1 && (
                             <div className="flex justify-center my-1">
                               <ArrowDown size={16} className="text-[#00ddff]" />
@@ -387,7 +449,6 @@ export default function GlitchMode() {
                 </div>
               </div>
 
-              {/* Export Options */}
               <div className="bg-[#18181b] border border-zinc-800 rounded-2xl p-4">
                 <h2 className="text-sm font-bold text-zinc-400 mb-3">EXPORT</h2>
                 <div className="space-y-2">
@@ -424,7 +485,6 @@ export default function GlitchMode() {
               </div>
             </div>
 
-            {/* Right: Transition Settings */}
             <div className="lg:col-span-2 space-y-4">
               {transitions.length > 0 ? (
                 <>
@@ -442,7 +502,6 @@ export default function GlitchMode() {
                         
                         return (
                           <div key={transition.id} className="space-y-3">
-                            {/* Transition Header */}
                             <button
                               onClick={() => setSelectedTransition(isSelected ? null : transition.id)}
                               className={cn(
@@ -472,7 +531,6 @@ export default function GlitchMode() {
                               </div>
                             </button>
 
-                            {/* Transition Settings */}
                             <AnimatePresence>
                               {isSelected && (
                                 <motion.div
@@ -590,6 +648,102 @@ export default function GlitchMode() {
                                       className="w-full"
                                     />
                                   </div>
+
+                                  {/* POST-PROCESSING SECTION */}
+                                  <div className="pt-4 border-t border-zinc-800">
+                                    <h3 className="text-xs font-bold text-[#ff00ff] mb-3 flex items-center gap-2">
+                                      <Sparkles size={14} />
+                                      POST-PROCESSING
+                                    </h3>
+
+                                    {/* Color Mode */}
+                                    <div className="mb-3">
+                                      <label className="text-xs text-zinc-500 mb-2 block flex items-center gap-2">
+                                        <Palette size={12} />
+                                        Color Mode
+                                      </label>
+                                      <div className="grid grid-cols-2 gap-2">
+                                        {(['normal', 'invert', 'grayscale', 'greyInvert'] as const).map((mode) => (
+                                          <button
+                                            key={mode}
+                                            onClick={() => updateTransition(transition.id, { colorMode: mode })}
+                                            className={cn(
+                                              "px-2 py-1.5 rounded text-[10px] font-bold transition-colors",
+                                              transition.colorMode === mode
+                                                ? "bg-[#ff00ff] text-black"
+                                                : "bg-zinc-800 text-zinc-400"
+                                            )}
+                                          >
+                                            {mode === 'greyInvert' ? 'Grey Invert' : mode.charAt(0).toUpperCase() + mode.slice(1)}
+                                          </button>
+                                        ))}
+                                      </div>
+                                    </div>
+
+                                    {/* Mirror Mode */}
+                                    <div className="mb-3">
+                                      <label className="text-xs text-zinc-500 mb-2 block flex items-center gap-2">
+                                        <Grid3x3 size={12} />
+                                        Mirror Mode
+                                      </label>
+                                      <div className="grid grid-cols-2 gap-2">
+                                        {(['none', 'horizontal', 'vertical', 'quad'] as const).map((mode) => (
+                                          <button
+                                            key={mode}
+                                            onClick={() => updateTransition(transition.id, { mirrorMode: mode })}
+                                            className={cn(
+                                              "px-2 py-1.5 rounded text-[10px] font-bold transition-colors",
+                                              transition.mirrorMode === mode
+                                                ? "bg-[#00ff88] text-black"
+                                                : "bg-zinc-800 text-zinc-400"
+                                            )}
+                                          >
+                                            {mode === 'quad' ? 'Quad (4-way)' : mode.charAt(0).toUpperCase() + mode.slice(1)}
+                                          </button>
+                                        ))}
+                                      </div>
+                                    </div>
+
+                                    {/* Repeat Echo */}
+                                    <div className="mb-3">
+                                      <label className="text-xs text-zinc-500 mb-2 block flex items-center gap-2">
+                                        <Repeat size={12} />
+                                        Repeat Echo: {transition.repeatEcho}
+                                      </label>
+                                      <input
+                                        type="range"
+                                        min={0}
+                                        max={10}
+                                        value={transition.repeatEcho}
+                                        onChange={(e) => updateTransition(transition.id, { repeatEcho: parseInt(e.target.value) })}
+                                        className="w-full"
+                                      />
+                                      <p className="text-[9px] text-zinc-600 mt-1">
+                                        {transition.repeatEcho === 0 ? 'No echo' : `Blend with previous ${transition.repeatEcho} frames`}
+                                      </p>
+                                    </div>
+
+                                    {/* Pattern Overlay */}
+                                    <div>
+                                      <label className="text-xs text-zinc-500 mb-2 block">Pattern Overlay</label>
+                                      <div className="grid grid-cols-3 gap-2">
+                                        {(['none', 'stripes', 'checkerboard'] as const).map((pattern) => (
+                                          <button
+                                            key={pattern}
+                                            onClick={() => updateTransition(transition.id, { patternOverlay: pattern })}
+                                            className={cn(
+                                              "px-2 py-1.5 rounded text-[10px] font-bold transition-colors",
+                                              transition.patternOverlay === pattern
+                                                ? "bg-[#00ddff] text-black"
+                                                : "bg-zinc-800 text-zinc-400"
+                                            )}
+                                          >
+                                            {pattern.charAt(0).toUpperCase() + pattern.slice(1)}
+                                          </button>
+                                        ))}
+                                      </div>
+                                    </div>
+                                  </div>
                                 </motion.div>
                               )}
                             </AnimatePresence>
@@ -599,7 +753,6 @@ export default function GlitchMode() {
                     </div>
                   </div>
 
-                  {/* Process Button */}
                   <button
                     onClick={processCascade}
                     disabled={processing}
